@@ -4,9 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Published immutable LaTeX Renderer Stable tag
+        description: Published immutable LaTeX Renderer tag
         type: string
         required: true
+      verify_only:
+        description: Verify build and installation of an RC without signing or publishing
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -28,12 +32,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
+          VERIFY_ONLY: ${{ inputs.verify_only }}
         run: |
           set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           repo=n624-dev/latex-renderer
-          gh api "repos/$repo/releases/latest" |
-            jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and .immutable and (.draft == false) and (.prerelease == false)'
+          if [ "$VERIFY_ONLY" = true ]; then
+            [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[1-9][0-9]*$ ]]
+            endpoint="tags/$RELEASE_TAG"
+          else
+            [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            endpoint=latest
+          fi
+          gh api "repos/$repo/releases/$endpoint" |
+            jq -e --arg tag "$RELEASE_TAG" --argjson candidate "$VERIFY_ONLY" \
+              '.tag_name == $tag and .immutable and (.draft == false) and (.prerelease == $candidate)'
           commit=$(gh api "repos/$repo/commits/$RELEASE_TAG" --jq .sha)
           [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
           asset="latex-renderer-server-${RELEASE_TAG#v}.tar.gz"
@@ -76,9 +88,12 @@ jobs:
           pnpm install --frozen-lockfile
           node client/build-client.mjs
           node deploy/apt/build-package.mjs "$ARCHITECTURE" packages-out
-          deb="packages-out/n624-latex_${RELEASE_TAG#v}_$ARCHITECTURE.deb"
+          version=${RELEASE_TAG#v}
+          package_version=${version/-rc./~rc.}
+          deb="packages-out/n624-latex_${package_version}_$ARCHITECTURE.deb"
           test "$(dpkg-deb -f "$deb" Architecture)" = "$ARCHITECTURE"
           test "$(dpkg-deb -f "$deb" Package)" = n624-latex
+          test "$(dpkg-deb -f "$deb" Version)" = "$package_version"
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y "./$deb"
           test ! -e /opt/latex-renderer
@@ -86,7 +101,11 @@ jobs:
           test "$(/usr/bin/n624-latex --version)" = "${RELEASE_TAG#v}"
           test "$(/usr/bin/latex-render --version)" = "${RELEASE_TAG#v}"
           /usr/bin/n624-latex admin update status --help
-          sudo /usr/bin/n624-latex server setup --plan
+          if [ "$version" = "$package_version" ]; then
+            sudo /usr/bin/n624-latex server setup --plan
+          else
+            sudo /usr/bin/n624-latex server setup --candidate "$RELEASE_TAG" --plan
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: latex-renderer-apt-${{ matrix.arch }}
@@ -97,6 +116,7 @@ jobs:
 
   sign:
     needs: [release, build]
+    if: ${{ !inputs.verify_only }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: latex-renderer-signing
